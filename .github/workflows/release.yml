@@ -136,7 +136,7 @@ jobs:
     if: success()
     
     outputs:
-      release-id: ${{ steps.create-release.outputs.id }}
+      release-tag: ${{ steps.version.outputs.version }}
       upload-url: ${{ steps.create-release.outputs.upload_url }}
     
     steps:
@@ -232,7 +232,7 @@ jobs:
             filename=$(basename "$file")
             
             # Upload using GitHub CLI
-            gh release upload "${{ needs.create-release.outputs.release-id }}" \
+            gh release upload "${{ needs.create-release.outputs.release-tag }}" \
               "$file" \
               --repo "${{ github.repository }}" \
               --clobber
@@ -250,7 +250,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Remove draft status
-          gh release edit "${{ needs.create-release.outputs.release-id }}" \
+          gh release edit "${{ needs.create-release.outputs.release-tag }}" \
             --repo "${{ github.repository }}" \
             --draft=false
 
@@ -258,8 +258,8 @@ jobs:
         run: |
           echo "## 🎉 Release Published Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version**: ${{ needs.create-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Release URL**: https://github.com/${{ github.repository }}/releases/tag/${{ needs.create-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Release URL**: https://github.com/${{ github.repository }}/releases/tag/${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Assets" >> $GITHUB_STEP_SUMMARY
           echo "- Linux: AppImage, deb, rpm" >> $GITHUB_STEP_SUMMARY
