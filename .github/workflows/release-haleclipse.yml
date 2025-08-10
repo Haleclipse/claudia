@@ -1,0 +1,324 @@
+name: Haleclipse Release Build & Publish
+
+# Trigger on version tags or manual dispatch
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'haleclipse-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Is this a pre-release?'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Release (${{ matrix.platform.name }})
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            ext: .AppImage
+          - name: Windows
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            ext: .exe
+          - name: macOS
+            os: macos-latest
+            rust-target: x86_64-apple-darwin
+            ext: .dmg
+    
+    runs-on: ${{ matrix.platform.os }}
+    
+    steps:
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Install system dependencies for Linux
+      - name: Install Linux dependencies
+        if: matrix.platform.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libglib2.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      # Setup Rust with caching
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.rust-target }}
+
+      # Cache Rust dependencies
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ${{ matrix.platform.os }}-rust-release-${{ hashFiles('**/Cargo.lock') }}
+          
+      # Setup Bun
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Cache Bun dependencies
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun
+            node_modules
+          key: ${{ matrix.platform.os }}-bun-${{ hashFiles('bun.lockb', 'package.json') }}
+          restore-keys: |
+            ${{ matrix.platform.os }}-bun-
+      
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # Build frontend
+      - name: Build frontend
+        run: bun run build
+
+      # Build Tauri application with bundle for release
+      - name: Build Tauri application
+        run: bun run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # Upload build artifacts
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform.name }}
+          path: |
+            src-tauri/target/release/bundle/**/*${{ matrix.platform.ext }}
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-release]
+    if: success()
+    
+    outputs:
+      release-tag: ${{ steps.version.outputs.version }}
+      upload-url: ${{ steps.create-release.outputs.upload_url }}
+    
+    steps:
+      # Checkout for changelog generation
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Determine version
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=haleclipse-v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "is_prerelease=${{ github.event.inputs.prerelease }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      # Generate changelog
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [[ -n "$PREV_TAG" ]]; then
+            echo "## 更改自 $PREV_TAG" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD >> CHANGELOG.md
+          else
+            echo "## 初始版本" > CHANGELOG.md
+          fi
+          
+          # Output changelog for the release body
+          {
+            echo 'changelog<<EOF'
+            cat CHANGELOG.md
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      # Create GitHub Release
+      - name: Create Release
+        id: create-release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Claudia ${{ steps.version.outputs.version }} (Haleclipse Fork)
+          body: |
+            <div align="center">
+              <img src="https://raw.githubusercontent.com/${{ github.repository }}/main/src-tauri/icons/icon.png" alt="Claudia Logo" width="128" height="128">
+              
+              # Claudia ${{ steps.version.outputs.version }}
+              
+              🚀 **Haleclipse Fork Release** 🚀
+            </div>
+            
+            ### 📝 更新日志
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ### 📦 下载
+            
+            #### Linux
+            - `.AppImage` - 通用Linux包 (推荐)
+            - `.deb` - Debian/Ubuntu包
+            - `.rpm` - RedHat/Fedora包
+            
+            #### Windows
+            - `.exe` - 安装程序
+            - `.msi` - Windows Installer包
+            
+            #### macOS
+            - `.dmg` - 磁盘映像安装器 (推荐)
+            - `.app` - 应用程序包
+            
+            ### 🛠️ 安装说明
+            
+            **Linux**: 下载 `.AppImage` 文件，添加执行权限 (`chmod +x`) 后运行。对于Debian/Ubuntu，使用 `.deb` 文件。
+            
+            **Windows**: 下载 `.exe` 或 `.msi` 文件并运行安装。
+            
+            **macOS**: 下载 `.dmg` 文件，打开后将Claudia拖拽到Applications文件夹。
+            
+            ### 🔐 验证
+            
+            所有文件都包含 `.sha256` 签名文件用于验证。
+            
+            ---
+            
+            基于 [getAsterisk/claudia](https://github.com/getAsterisk/claudia) 项目
+          draft: true
+          prerelease: ${{ steps.version.outputs.is_prerelease }}
+          files: |
+            release-assets/*
+
+  upload-assets:
+    name: Upload Release Assets
+    runs-on: ubuntu-latest
+    needs: [build-release, create-release]
+    strategy:
+      matrix:
+        platform: [Linux, Windows, macOS]
+    
+    steps:
+      # Download build artifacts
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ./artifacts
+
+      # Prepare and upload release assets
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          
+          # Generate SHA256 checksums for all files
+          find ./artifacts -type f \( \
+            -name "*.AppImage" -o \
+            -name "*.deb" -o \
+            -name "*.rpm" -o \
+            -name "*.exe" -o \
+            -name "*.msi" -o \
+            -name "*.dmg" -o \
+            -name "*.app" \
+          \) | while read -r file; do
+            filename=$(basename "$file")
+            cp "$file" "release-assets/"
+            cd release-assets && sha256sum "$filename" > "$filename.sha256" && cd ..
+          done
+
+      # Upload Release Assets
+      - name: Upload Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Upload all prepared assets
+          find ./release-assets -type f | while read -r file; do
+            echo "上传: $file"
+            filename=$(basename "$file")
+            
+            # Upload using GitHub CLI
+            gh release upload "${{ needs.create-release.outputs.release-tag }}" \
+              "$file" \
+              --repo "${{ github.repository }}" \
+              --clobber
+          done
+
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [create-release, upload-assets]
+    if: success()
+    
+    steps:
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Remove draft status
+          gh release edit "${{ needs.create-release.outputs.release-tag }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
+
+      - name: Create release summary
+        run: |
+          echo "## 🎉 发布成功!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**版本**: ${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**发布地址**: https://github.com/${{ github.repository }}/releases/tag/${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 资源" >> $GITHUB_STEP_SUMMARY
+          echo "- Linux: AppImage, deb, rpm" >> $GITHUB_STEP_SUMMARY
+          echo "- Windows: exe, msi" >> $GITHUB_STEP_SUMMARY
+          echo "- macOS: dmg, app" >> $GITHUB_STEP_SUMMARY
