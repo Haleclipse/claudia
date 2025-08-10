@@ -2,16 +2,16 @@ use anyhow::Result;
 use chrono;
 use dirs;
 use log::{debug, error, info, warn};
-use regex;
 use reqwest;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_shell::process::CommandEvent;
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 
@@ -796,6 +796,18 @@ fn create_agent_sidecar_command(
     // Set working directory
     sidecar_cmd = sidecar_cmd.current_dir(project_path);
     
+    // Pass through proxy environment variables if they exist (only uppercase)
+    for (key, value) in std::env::vars() {
+        if key == "HTTP_PROXY"
+            || key == "HTTPS_PROXY"
+            || key == "NO_PROXY"
+            || key == "ALL_PROXY"
+        {
+            debug!("Setting proxy env var for agent sidecar: {}={}", key, value);
+            sidecar_cmd = sidecar_cmd.env(&key, &value);
+        }
+    }
+    
     Ok(sidecar_cmd)
 }
 
@@ -824,31 +836,31 @@ fn create_agent_system_command(
 async fn spawn_agent_sidecar(
     app: AppHandle,
     run_id: i64,
-    _agent_id: i64,
-    _agent_name: String,
+    agent_id: i64,
+    agent_name: String,
     args: Vec<String>,
     project_path: String,
-    _task: String,
-    _execution_model: String,
+    task: String,
+    execution_model: String,
     db: State<'_, AgentDb>,
     registry: State<'_, crate::process::ProcessRegistryState>,
 ) -> Result<i64, String> {
-    use std::sync::Mutex;
-
-    // Create the sidecar command
+    // Build the sidecar command
     let sidecar_cmd = create_agent_sidecar_command(&app, args, &project_path)?;
-    
-    // Spawn the sidecar process
-    let (mut rx, child) = sidecar_cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn Claude sidecar: {}", e))?;
 
-    // Get the child PID for logging
+    // Spawn the process
+    info!("🚀 Spawning Claude sidecar process...");
+    let (mut receiver, child) = sidecar_cmd.spawn().map_err(|e| {
+        error!("❌ Failed to spawn Claude sidecar process: {}", e);
+        format!("Failed to spawn Claude sidecar: {}", e)
+    })?;
+
+    // Get the PID from child
     let pid = child.pid();
-    info!("✅ Spawned Claude sidecar process with PID: {:?}", pid);
+    let now = chrono::Utc::now().to_rfc3339();
+    info!("✅ Claude sidecar process spawned successfully with PID: {}", pid);
 
     // Update the database with PID and status
-    let now = chrono::Utc::now().to_rfc3339();
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -858,83 +870,99 @@ async fn spawn_agent_sidecar(
         info!("📝 Updated database with running status and PID");
     }
 
-    // We'll extract the session ID from Claude's init message
-    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Create variables we need for the spawned task
+    // Get app directory for database path
     let app_dir = app
         .path()
         .app_data_dir()
         .expect("Failed to get app data dir");
     let db_path = app_dir.join("agents.db");
-    let db_path_for_stream = db_path.clone(); // Clone for the streaming task
 
-    // Spawn task to read events from sidecar
-    let app_handle = app.clone();
-    let session_id_holder_clone = session_id_holder.clone();
+    // Shared state for collecting session ID and live output
+    let session_id = std::sync::Arc::new(Mutex::new(String::new()));
     let live_output = std::sync::Arc::new(Mutex::new(String::new()));
+    let _start_time = std::time::Instant::now();
+
+    // Register the process in the registry
+    registry
+        .0
+        .register_sidecar_process(
+            run_id,
+            agent_id,
+            agent_name,
+            pid as u32,
+            project_path.clone(),
+            task.clone(),
+            execution_model.clone(),
+        )
+        .map_err(|e| format!("Failed to register sidecar process: {}", e))?;
+    info!("📋 Registered sidecar process in registry");
+
+    // Handle sidecar events
+    let app_handle = app.clone();
+    let session_id_clone = session_id.clone();
     let live_output_clone = live_output.clone();
     let registry_clone = registry.0.clone();
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let first_output_clone = first_output.clone();
+    let db_path_for_sidecar = db_path.clone();
 
-    let sidecar_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         info!("📖 Starting to read Claude sidecar events...");
         let mut line_count = 0;
 
-        while let Some(event) = rx.recv().await {
+        while let Some(event) = receiver.recv().await {
             match event {
-                tauri_plugin_shell::process::CommandEvent::Stdout(data) => {
-                    let line = String::from_utf8_lossy(&data).trim().to_string();
-                    if !line.is_empty() {
-                        line_count += 1;
+                CommandEvent::Stdout(line_bytes) => {
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    line_count += 1;
 
-                        // Log first output
-                        if !first_output_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                            info!("🎉 First output received from Claude sidecar! Line: {}", line);
-                            first_output_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                    // Log first output
+                    if !first_output_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        info!(
+                            "🎉 First output received from Claude sidecar process! Line: {}",
+                            line
+                        );
+                        first_output_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
 
-                        if line_count <= 5 {
-                            info!("sidecar stdout[{}]: {}", line_count, line);
-                        } else {
-                            debug!("sidecar stdout[{}]: {}", line_count, line);
-                        }
+                    if line_count <= 5 {
+                        info!("sidecar stdout[{}]: {}", line_count, line);
+                    } else {
+                        debug!("sidecar stdout[{}]: {}", line_count, line);
+                    }
 
-                        // Store live output
-                        if let Ok(mut output) = live_output_clone.lock() {
-                            output.push_str(&line);
-                            output.push('\n');
-                        }
+                    // Store live output
+                    if let Ok(mut output) = live_output_clone.lock() {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
 
-                        // Also store in process registry for cross-session access
-                        let _ = registry_clone.append_live_output(run_id, &line);
+                    // Also store in process registry
+                    let _ = registry_clone.append_live_output(run_id, &line);
 
-                        // Extract session ID from JSONL output
-                        if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
-                            // Claude Code uses "session_id" (underscore), not "sessionId"
-                            if json.get("type").and_then(|t| t.as_str()) == Some("system") &&
-                               json.get("subtype").and_then(|s| s.as_str()) == Some("init") {
-                                if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
-                                    if let Ok(mut current_session_id) = session_id_holder_clone.lock() {
-                                        if current_session_id.is_none() {
-                                            *current_session_id = Some(sid.to_string());
-                                            info!("🔑 Extracted session ID: {}", sid);
-                                            
-                                            // Update database immediately with session ID
-                                            if let Ok(conn) = Connection::open(&db_path_for_stream) {
-                                                match conn.execute(
-                                                    "UPDATE agent_runs SET session_id = ?1 WHERE id = ?2",
-                                                    params![sid, run_id],
-                                                ) {
-                                                    Ok(rows) => {
-                                                        if rows > 0 {
-                                                            info!("✅ Updated agent run {} with session ID immediately", run_id);
-                                                        }
+                    // Extract session ID from JSONL output
+                    if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
+                        if json.get("type").and_then(|t| t.as_str()) == Some("system") &&
+                           json.get("subtype").and_then(|s| s.as_str()) == Some("init") {
+                            if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
+                                if let Ok(mut current_session_id) = session_id_clone.lock() {
+                                    if current_session_id.is_empty() {
+                                        *current_session_id = sid.to_string();
+                                        info!("🔑 Extracted session ID: {}", sid);
+                                        
+                                        // Update database immediately with session ID
+                                        if let Ok(conn) = Connection::open(&db_path_for_sidecar) {
+                                            match conn.execute(
+                                                "UPDATE agent_runs SET session_id = ?1 WHERE id = ?2",
+                                                params![sid, run_id],
+                                            ) {
+                                                Ok(rows) => {
+                                                    if rows > 0 {
+                                                        info!("✅ Updated agent run {} with session ID immediately", run_id);
                                                     }
-                                                    Err(e) => {
-                                                        error!("❌ Failed to update session ID immediately: {}", e);
-                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("❌ Failed to update session ID immediately: {}", e);
                                                 }
                                             }
                                         }
@@ -942,114 +970,46 @@ async fn spawn_agent_sidecar(
                                 }
                             }
                         }
+                    }
 
-                        // Emit the line to the frontend with run_id for isolation
-                        let _ = app_handle.emit(&format!("agent-output:{}", run_id), &line);
-                        // Also emit to the generic event for backward compatibility
-                        let _ = app_handle.emit("agent-output", &line);
-                    }
+                    // Emit the line to the frontend
+                    let _ = app_handle.emit(&format!("agent-output:{}", run_id), &line);
+                    let _ = app_handle.emit("agent-output", &line);
                 }
-                tauri_plugin_shell::process::CommandEvent::Stderr(data) => {
-                    let line = String::from_utf8_lossy(&data).trim().to_string();
-                    if !line.is_empty() {
-                        error!("sidecar stderr: {}", line);
-                        // Emit error lines to the frontend with run_id for isolation
-                        let _ = app_handle.emit(&format!("agent-error:{}", run_id), &line);
-                        // Also emit to the generic event for backward compatibility
-                        let _ = app_handle.emit("agent-error", &line);
-                    }
+                CommandEvent::Stderr(line_bytes) => {
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    error!("sidecar stderr: {}", line);
+                    let _ = app_handle.emit(&format!("agent-error:{}", run_id), &line);
+                    let _ = app_handle.emit("agent-error", &line);
                 }
-                tauri_plugin_shell::process::CommandEvent::Terminated { .. } => {
-                    info!("📖 Claude sidecar process terminated");
+                CommandEvent::Terminated(payload) => {
+                    info!("Claude sidecar process terminated with code: {:?}", payload.code);
+                    
+                    // Get the session ID
+                    let extracted_session_id = if let Ok(sid) = session_id.lock() {
+                        sid.clone()
+                    } else {
+                        String::new()
+                    };
+
+                    // Update database with completion
+                    if let Ok(conn) = Connection::open(&db_path) {
+                        let _ = conn.execute(
+                            "UPDATE agent_runs SET session_id = ?1, status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                            params![extracted_session_id, run_id],
+                        );
+                    }
+
+                    let success = payload.code.unwrap_or(1) == 0;
+                    let _ = app.emit("agent-complete", success);
+                    let _ = app.emit(&format!("agent-complete:{}", run_id), success);
                     break;
                 }
-                tauri_plugin_shell::process::CommandEvent::Error(e) => {
-                    error!("🔥 Claude sidecar error: {}", e);
-                    break;
-                }
-                _ => {
-                    // Handle any other event types we might not know about
-                    debug!("Received unknown sidecar event type");
-                }
+                _ => {}
             }
         }
 
         info!("📖 Finished reading Claude sidecar events. Total lines: {}", line_count);
-    });
-
-    // Monitor process status and wait for completion
-    tokio::spawn(async move {
-        info!("🕐 Starting sidecar process monitoring...");
-
-        // Wait for first output with timeout
-        for i in 0..300 {
-            // 30 seconds (300 * 100ms)
-            if first_output.load(std::sync::atomic::Ordering::Relaxed) {
-                info!("✅ Output detected after {}ms, continuing normal execution", i * 100);
-                break;
-            }
-
-            if i == 299 {
-                warn!("⏰ TIMEOUT: No output from Claude sidecar after 30 seconds");
-                warn!("💡 This usually means:");
-                warn!("   1. Claude sidecar is waiting for user input");
-                warn!("   2. Authentication issues (API key not found/invalid)");
-                warn!("   3. Network connectivity issues");
-                warn!("   4. Claude failed to initialize but didn't report an error");
-
-                // Update database with failed status
-                if let Ok(conn) = Connection::open(&db_path) {
-                    let _ = conn.execute(
-                        "UPDATE agent_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                        params![run_id],
-                    );
-                }
-
-                let _ = app.emit("agent-complete", false);
-                let _ = app.emit(&format!("agent-complete:{}", run_id), false);
-                return;
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-
-        // Wait for sidecar task to complete
-        info!("⏳ Waiting for sidecar reading to complete...");
-        let _ = sidecar_task.await;
-
-        // Get the session ID that was extracted
-        let extracted_session_id = if let Ok(Some(sid)) = session_id_holder.lock().map(|s| s.clone()) {
-            sid
-        } else {
-            String::new()
-        };
-
-        // Update the run record with session ID and mark as completed
-        if let Ok(conn) = Connection::open(&db_path) {
-            info!("🔄 Updating database with extracted session ID: {}", extracted_session_id);
-            match conn.execute(
-                "UPDATE agent_runs SET session_id = ?1, status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?2",
-                params![extracted_session_id, run_id],
-            ) {
-                Ok(rows_affected) => {
-                    if rows_affected > 0 {
-                        info!("✅ Successfully updated agent run {} with session ID: {}", run_id, extracted_session_id);
-                    } else {
-                        warn!("⚠️ No rows affected when updating agent run {} with session ID", run_id);
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Failed to update agent run {} with session ID: {}", run_id, e);
-                }
-            }
-        } else {
-            error!("❌ Failed to open database to update session ID for run {}", run_id);
-        }
-
-        info!("✅ Claude sidecar execution monitoring complete");
-
-        let _ = app.emit("agent-complete", true);
-        let _ = app.emit(&format!("agent-complete:{}", run_id), true);
     });
 
     Ok(run_id)
@@ -1830,20 +1790,7 @@ pub async fn get_claude_binary_path(db: State<'_, AgentDb>) -> Result<Option<Str
 pub async fn set_claude_binary_path(db: State<'_, AgentDb>, path: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    // Special handling for bundled sidecar reference
-    if path == "claude-code" {
-        // For bundled sidecar, we don't need to validate file existence
-        // as it's handled by Tauri's sidecar system
-        conn.execute(
-            "INSERT INTO app_settings (key, value) VALUES ('claude_binary_path', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = ?1",
-            params![path],
-        )
-        .map_err(|e| format!("Failed to save Claude binary path: {}", e))?;
-        return Ok(());
-    }
-
-    // Validate that the path exists and is executable for system installations
+    // Validate that the path exists and is executable
     let path_buf = std::path::PathBuf::from(&path);
     if !path_buf.exists() {
         return Err(format!("File does not exist: {}", path));
@@ -1875,83 +1822,12 @@ pub async fn set_claude_binary_path(db: State<'_, AgentDb>, path: String) -> Res
 /// List all available Claude installations on the system
 #[tauri::command]
 pub async fn list_claude_installations(
-    app: AppHandle,
+    _app: AppHandle,
 ) -> Result<Vec<crate::claude_binary::ClaudeInstallation>, String> {
-    let mut installations = crate::claude_binary::discover_claude_installations();
+    let installations = crate::claude_binary::discover_claude_installations();
 
     if installations.is_empty() {
         return Err("No Claude Code installations found on the system".to_string());
-    }
-
-    // For bundled installations, execute the sidecar to get the actual version
-    for installation in &mut installations {
-        if installation.installation_type == crate::claude_binary::InstallationType::Bundled {
-            // Try to get the version by executing the sidecar
-            use tauri_plugin_shell::process::CommandEvent;
-            
-            // Create a temporary directory for the sidecar to run in
-            let temp_dir = std::env::temp_dir();
-            
-            // Create sidecar command with --version flag
-            let sidecar_cmd = match app
-                .shell()
-                .sidecar("claude-code") {
-                Ok(cmd) => cmd.args(["--version"]).current_dir(&temp_dir),
-                Err(e) => {
-                    log::warn!("Failed to create sidecar command for version check: {}", e);
-                    continue;
-                }
-            };
-            
-            // Spawn the sidecar and collect output
-            match sidecar_cmd.spawn() {
-                Ok((mut rx, _child)) => {
-                    let mut stdout_output = String::new();
-                    let mut stderr_output = String::new();
-                    
-                    // Set a timeout for version check
-                    let timeout = tokio::time::Duration::from_secs(5);
-                    let start_time = tokio::time::Instant::now();
-                    
-                    while let Ok(Some(event)) = tokio::time::timeout_at(
-                        start_time + timeout,
-                        rx.recv()
-                    ).await {
-                        match event {
-                            CommandEvent::Stdout(data) => {
-                                stdout_output.push_str(&String::from_utf8_lossy(&data));
-                            }
-                            CommandEvent::Stderr(data) => {
-                                stderr_output.push_str(&String::from_utf8_lossy(&data));
-                            }
-                            CommandEvent::Terminated { .. } => {
-                                break;
-                            }
-                            CommandEvent::Error(e) => {
-                                log::warn!("Error during sidecar version check: {}", e);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    
-                    // Use regex to directly extract version pattern
-                    let version_regex = regex::Regex::new(r"(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?)").ok();
-                    
-                    if let Some(regex) = version_regex {
-                        if let Some(captures) = regex.captures(&stdout_output) {
-                            if let Some(version_match) = captures.get(1) {
-                                installation.version = Some(version_match.as_str().to_string());
-                                log::info!("Bundled sidecar version: {}", version_match.as_str());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to spawn sidecar for version check: {}", e);
-                }
-            }
-        }
     }
 
     Ok(installations)
@@ -2011,26 +1887,6 @@ fn create_command_with_env(program: &str) -> Command {
     } else {
         tokio_cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
     }
-
-    // BEGIN PATCH: Ensure bundled sidecar directory is in PATH when using the "claude-code" placeholder
-    if program == "claude-code" {
-        // Attempt to locate the sidecar binaries directory that Tauri uses during development
-        // At compile-time, CARGO_MANIFEST_DIR resolves to the absolute path of the src-tauri crate.
-        // The sidecar binaries live in <src-tauri>/binaries.
-        #[allow(clippy::redundant_clone)]
-        let sidecar_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
-        if sidecar_dir.exists() {
-            if let Some(sidecar_dir_str) = sidecar_dir.to_str() {
-                let current_path = std::env::var("PATH").unwrap_or_default();
-                let separator = if cfg!(target_os = "windows") { ";" } else { ":" };
-                if !current_path.split(separator).any(|p| p == sidecar_dir_str) {
-                    let new_path = format!("{}{}{}", sidecar_dir_str, separator, current_path);
-                    tokio_cmd.env("PATH", new_path);
-                }
-            }
-        }
-    }
-    // END PATCH
 
     tokio_cmd
 }

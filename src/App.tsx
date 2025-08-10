@@ -4,6 +4,7 @@ import { Plus, Loader2, Bot, FolderCode } from "lucide-react";
 import { api, type Project, type Session, type ClaudeMdFile } from "@/lib/api";
 import { OutputCacheProvider } from "@/lib/outputCache";
 import { TabProvider } from "@/contexts/TabContext";
+import { ThemeProvider } from "@/contexts/ThemeContext";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ProjectList } from "@/components/ProjectList";
@@ -24,6 +25,8 @@ import { TabManager } from "@/components/TabManager";
 import { TabContent } from "@/components/TabContent";
 import { AgentsModal } from "@/components/AgentsModal";
 import { useTabState } from "@/hooks/useTabState";
+import { AnalyticsConsentBanner } from "@/components/AnalyticsConsent";
+import { useAppLifecycle, useTrackEvent } from "@/hooks";
 
 type View = 
   | "welcome" 
@@ -59,6 +62,26 @@ function AppContent() {
   const [projectForSettings, setProjectForSettings] = useState<Project | null>(null);
   const [previousView] = useState<View>("welcome");
   const [showAgentsModal, setShowAgentsModal] = useState(false);
+  
+  // Initialize analytics lifecycle tracking
+  useAppLifecycle();
+  const trackEvent = useTrackEvent();
+  
+  // Track user journey milestones
+  const [hasTrackedFirstChat] = useState(false);
+  // const [hasTrackedFirstAgent] = useState(false);
+  
+  // Track when user reaches different journey stages
+  useEffect(() => {
+    if (view === "projects" && projects.length > 0 && !hasTrackedFirstChat) {
+      // User has projects - they're past onboarding
+      trackEvent.journeyMilestone({
+        journey_stage: 'onboarding',
+        milestone_reached: 'projects_created',
+        time_to_milestone_ms: Date.now() - performance.timing.navigationStart
+      });
+    }
+  }, [view, projects.length, hasTrackedFirstChat, trackEvent]);
 
   // Load projects on mount when in projects view
   useEffect(() => {
@@ -463,6 +486,9 @@ function AppContent() {
         onAgentsClick={() => setShowAgentsModal(true)}
       />
       
+      {/* Analytics Consent Banner */}
+      <AnalyticsConsentBanner />
+      
       {/* Main Content */}
       <div className="flex-1 overflow-hidden">
         {renderContent()}
@@ -508,11 +534,13 @@ function AppContent() {
  */
 function App() {
   return (
-    <OutputCacheProvider>
-      <TabProvider>
-        <AppContent />
-      </TabProvider>
-    </OutputCacheProvider>
+    <ThemeProvider>
+      <OutputCacheProvider>
+        <TabProvider>
+          <AppContent />
+        </TabProvider>
+      </OutputCacheProvider>
+    </ThemeProvider>
   );
 }
 

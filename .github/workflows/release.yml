@@ -1,267 +1,141 @@
-name: Release Build & Publish
+name: Release
 
-# Trigger on version tags or manual dispatch
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 1.0.0)'
+        description: 'Version to release (e.g., v1.0.0)'
         required: true
         type: string
-      prerelease:
-        description: 'Is this a pre-release?'
-        required: false
-        type: boolean
-        default: false
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+permissions:
+  contents: write
 
 jobs:
-  build-release:
-    name: Build Release (${{ matrix.platform.name }})
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: Linux
-            os: ubuntu-latest
-            rust-target: x86_64-unknown-linux-gnu
-            ext: .AppImage
-          - name: Windows
-            os: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            ext: .exe
-          - name: macOS
-            os: macos-latest
-            rust-target: x86_64-apple-darwin
-            ext: .dmg
-    
-    runs-on: ${{ matrix.platform.os }}
-    
-    steps:
-      # Checkout the repository
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+  # Build jobs for each platform
+  build-linux:
+    uses: ./.github/workflows/build-linux.yml
+    secrets: inherit
+  
+  build-macos:
+    uses: ./.github/workflows/build-macos.yml
+    secrets: inherit
+  
 
-      # Install system dependencies for Linux
-      - name: Install Linux dependencies
-        if: matrix.platform.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libglib2.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libsoup-3.0-dev \
-            libxdo-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev
-
-      # Setup Rust with caching
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform.rust-target }}
-
-      # Cache Rust dependencies
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-          key: ${{ matrix.platform.os }}-rust-release-${{ hashFiles('**/Cargo.lock') }}
-          
-      # Setup Bun
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      # Cache Bun dependencies
-      - name: Cache Bun dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.bun
-            node_modules
-          key: ${{ matrix.platform.os }}-bun-${{ hashFiles('bun.lockb', 'package.json') }}
-          restore-keys: |
-            ${{ matrix.platform.os }}-bun-
-      
-      # Install frontend dependencies
-      - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
-
-      # Build frontend
-      - name: Build frontend
-        run: bun run build
-
-      # Build Tauri application with bundle for release
-      - name: Build Tauri application
-        run: bun run tauri build
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      # Upload build artifacts
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.platform.name }}
-          path: |
-            src-tauri/target/release/bundle/**/*${{ matrix.platform.ext }}
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.deb
-            src-tauri/target/release/bundle/**/*.rpm
-            src-tauri/target/release/bundle/**/*.AppImage
-            src-tauri/target/release/bundle/**/*.dmg
-            src-tauri/target/release/bundle/**/*.app
-          retention-days: 7
-
+  # Create release after all builds complete
   create-release:
-    name: Create GitHub Release
+    name: Create Release
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
-    needs: [build-release]
-    if: success()
-    
-    outputs:
-      release-tag: ${{ steps.version.outputs.version }}
-      upload-url: ${{ steps.create-release.outputs.upload_url }}
     
     steps:
-      # Checkout for changelog generation
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # Determine version
+      - uses: actions/checkout@v4
+      
       - name: Determine version
         id: version
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "is_prerelease=${{ github.event.inputs.prerelease }}" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
           else
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            if [[ "${{ github.ref_name }}" == *"-"* ]]; then
-              echo "is_prerelease=true" >> $GITHUB_OUTPUT
-            else
-              echo "is_prerelease=false" >> $GITHUB_OUTPUT
-            fi
+            VERSION="${{ inputs.version }}"
           fi
-
-      # Generate changelog (optional)
-      - name: Generate changelog
-        id: changelog
-        run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          
-          if [[ -n "$PREV_TAG" ]]; then
-            echo "## Changes since $PREV_TAG" > CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD >> CHANGELOG.md
-          else
-            echo "## Initial Release" > CHANGELOG.md
-          fi
-          
-          # Output changelog for the release body
-          {
-            echo 'changelog<<EOF'
-            cat CHANGELOG.md
-            echo EOF
-          } >> $GITHUB_OUTPUT
-
-      # Create GitHub Release
-      - name: Create Release
-        id: create-release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          release_name: Release ${{ steps.version.outputs.version }}
-          body: ${{ steps.changelog.outputs.changelog }}
-          draft: true
-          prerelease: ${{ steps.version.outputs.is_prerelease }}
-
-  upload-assets:
-    name: Upload Release Assets
-    runs-on: ubuntu-latest
-    needs: [build-release, create-release]
-    strategy:
-      matrix:
-        platform: [Linux, Windows, macOS]
-    
-    steps:
-      # Download build artifacts
-      - name: Download artifacts
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+      
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
-          path: ./artifacts
-
-      # Find and upload release assets
-      - name: Upload Release Assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          path: artifacts
+      
+      - name: Prepare release assets
         run: |
-          # Find all release files
-          find ./artifacts -type f \( \
-            -name "*.AppImage" -o \
-            -name "*.deb" -o \
-            -name "*.rpm" -o \
-            -name "*.exe" -o \
-            -name "*.msi" -o \
-            -name "*.dmg" -o \
-            -name "*.app" \
-          \) | while read -r file; do
-            echo "Uploading: $file"
-            filename=$(basename "$file")
-            
-            # Upload using GitHub CLI
-            gh release upload "${{ needs.create-release.outputs.release-tag }}" \
-              "$file" \
-              --repo "${{ github.repository }}" \
-              --clobber
+          mkdir -p release-assets
+          
+          # Linux artifacts
+          if [ -d "artifacts/linux-x86_64" ]; then
+            cp artifacts/linux-x86_64/*.deb release-assets/Claudia_${{ steps.version.outputs.version }}_linux_x86_64.deb || true
+            cp artifacts/linux-x86_64/*.AppImage release-assets/Claudia_${{ steps.version.outputs.version }}_linux_x86_64.AppImage || true
+          fi
+          
+          # macOS artifacts
+          if [ -d "artifacts/macos-universal" ]; then
+            cp artifacts/macos-universal/Claudia.dmg release-assets/Claudia_${{ steps.version.outputs.version }}_macos_universal.dmg || true
+            cp artifacts/macos-universal/Claudia.app.zip release-assets/Claudia_${{ steps.version.outputs.version }}_macos_universal.app.tar.gz || true
+          fi
+          
+          # Create source code archives
+          # Clean version without 'v' prefix for archive names
+          CLEAN_VERSION="${{ steps.version.outputs.version }}"
+          CLEAN_VERSION="${CLEAN_VERSION#v}"
+          
+          # Create source code archives (excluding .git and other unnecessary files)
+          echo "Creating source code archives..."
+          
+          # Create a clean export of the repository
+          git archive --format=tar.gz --prefix=claudia-${CLEAN_VERSION}/ -o release-assets/claudia-${CLEAN_VERSION}.tar.gz HEAD
+          git archive --format=zip --prefix=claudia-${CLEAN_VERSION}/ -o release-assets/claudia-${CLEAN_VERSION}.zip HEAD
+
+          # Generate signatures for all files
+          cd release-assets
+          for file in *; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" > "$file.sha256"
+            fi
           done
+          cd ..
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Claudia ${{ steps.version.outputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: release-assets/*
+          body: |
+            <div align="center">
+              <img src="https://raw.githubusercontent.com/${{ github.repository }}/${{ steps.version.outputs.version }}/src-tauri/icons/icon.png" alt="Claudia Logo" width="128" height="128">
+              
+              # Claudia ${{ steps.version.outputs.version }}
+              
+              🎉 **First Release!** 🎉
+            
+            ### 🚀 What's New in This First Release
+            
+            - **AI-Powered Coding**: Seamless integration with Claude for intelligent code assistance
+            - **Cross-Platform Support**: Available for macOS and Linux
+            - **Modern UI**: Clean, intuitive interface built with React and Tauri
+            - **MCP Support**: Model Context Protocol integration for enhanced capabilities
+            - **Session Management**: Save and restore your coding sessions
+            - **And much more!**
+            
+            ### Downloads
+            
+            #### macOS
+            - Universal binary (Intel + Apple Silicon)
+            - `.dmg` - Disk image installer (recommended)
+            - `.app.tar.gz` - Application bundle
+            
 
-  publish-release:
-    name: Publish Release
-    runs-on: ubuntu-latest
-    needs: [create-release, upload-assets]
-    if: success()
-    
-    steps:
-      - name: Publish GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Remove draft status
-          gh release edit "${{ needs.create-release.outputs.release-tag }}" \
-            --repo "${{ github.repository }}" \
-            --draft=false
+            #### Linux
+            - `.AppImage` - Universal Linux package (recommended)
+            - `.deb` - Debian/Ubuntu package
+            
+            #### Source Code
+            - `claudia-{version}.tar.gz` - Source code (tar.gz)
+            - `claudia-{version}.zip` - Source code (zip)
+            
+            ### Installation
+            
+            **macOS**: Download the `.dmg` file, open it, and drag Claudia to your Applications folder.
+            
 
-      - name: Create release summary
-        run: |
-          echo "## 🎉 Release Published Successfully!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version**: ${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Release URL**: https://github.com/${{ github.repository }}/releases/tag/${{ needs.create-release.outputs.release-tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Assets" >> $GITHUB_STEP_SUMMARY
-          echo "- Linux: AppImage, deb, rpm" >> $GITHUB_STEP_SUMMARY
-          echo "- Windows: exe, msi" >> $GITHUB_STEP_SUMMARY
-          echo "- macOS: dmg, app" >> $GITHUB_STEP_SUMMARY
+            **Linux**: Download the `.AppImage` file, make it executable (`chmod +x`), and run it. For Debian/Ubuntu, use the `.deb` file.
+            
+            ### Verification
+            
+            All files include `.sha256` signature files for verification.
